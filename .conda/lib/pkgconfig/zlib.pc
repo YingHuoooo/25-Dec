@@ -1,0 +1,13 @@
+prefix=/Users/mar555/Desktop/code/2025/Dec/.conda
+exec_prefix=/Users/mar555/Desktop/code/2025/Dec/.conda
+libdir=/Users/mar555/Desktop/code/2025/Dec/.conda/lib
+sharedlibdir=/Users/mar555/Desktop/code/2025/Dec/.conda/lib
+includedir=/Users/mar555/Desktop/code/2025/Dec/.conda/include
+
+Name: zlib
+Description: zlib compression library
+Version: 1.2.13
+
+Requires:
+Libs: -L${libdir} -L${sharedlibdir} -lz
+Cflags: -I${includedir}

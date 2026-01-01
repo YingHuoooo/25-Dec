@@ -1,0 +1,5 @@
+#!/Users/mar555/Desktop/code/2025/Dec/.conda/bin/python3.11
+
+import pydoc
+if __name__ == '__main__':
+    pydoc.cli()
