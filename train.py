@@ -17,7 +17,7 @@ print("Loading Dataset...")
 # 先生成一次词表
 # import build_vocab; build_vocab.build_skeleton_vocab("complex_cnc_dataset_qwen.jsonl")
 
-dataset = CNCDataset("complex_cnc_dataset_qwen.jsonl", "skeleton_vocab.json")
+dataset = CNCDataset("complex_cnc_dataset_qwen2.jsonl", "skeleton_vocab.json")
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # 加载词表大小

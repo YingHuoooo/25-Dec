@@ -1,0 +1,1 @@
+{"[PAD]": 0, "[BOS]": 1, "[EOS]": 2, "[ARG]": 3, "result": 4, "=": 5, "cq": 6, ".": 7, "Workplane": 8, "(": 9, "'XY'": 10, ")": 11, "cylinder": 12, ",": 13, "faces": 14, "'>Z'": 15, "edges": 16, "chamfer": 17, "polygon": 18, "extrude": 19, "'|Z'": 20, "fillet": 21, "box": 22, "'>X'": 23, "workplane": 24, "hole": 25, "rect": 26, "cutBlind": 27, "-[ARG]": 28, "circle": 29}

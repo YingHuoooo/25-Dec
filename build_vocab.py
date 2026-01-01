@@ -36,6 +36,6 @@ def tokenize_skeleton(skel_str):
     return skel_str.split()
 
 if __name__ == "__main__":
-    vocab = build_skeleton_vocab("complex_cnc_dataset_qwen.jsonl")
+    vocab = build_skeleton_vocab("complex_cnc_dataset_qwen2.jsonl")
     with open("skeleton_vocab.json", "w") as f:
         json.dump(vocab, f)
