@@ -5,6 +5,7 @@ import os
 import gc
 import math
 import multiprocessing as mp
+import queue  # 用于带超时的队列读取
 from openai import OpenAI
 from tqdm import tqdm
 
@@ -501,7 +502,8 @@ def generate_text_with_qwen(code_str):
             model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=180
+            max_tokens=180,
+            timeout=15,  # 新增：请求超时，防止长时间卡住
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -534,6 +536,13 @@ def get_start_id(filename):
         print("📂 文件不存在，将创建新文件并从 ID 0 开始...")
     return start_id
 
+# ---------- 阶段显示辅助 ----------
+def set_stage(pbar, stage):
+    """在 tqdm 后缀和 stdout 同时显示当前阶段。"""
+    if pbar:
+        pbar.set_postfix_str(stage)
+    print(f"[stage] {stage}")
+
 # ---------- 主流程（子进程隔离几何） ----------
 def main():
     start_id = get_start_id(OUTPUT_FILE)
@@ -547,47 +556,65 @@ def main():
     with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
         pbar = tqdm(total=NUM_SAMPLES)
         while success_count < NUM_SAMPLES:
+            set_stage(pbar, "spawn worker")
             q = mp.Queue()
             p = mp.Process(target=worker_generate_sample, args=(q,))
             p.start()
+
+            set_stage(pbar, "wait worker")
             p.join(WORKER_TIMEOUT)
 
             # 超时或异常退出
             if p.is_alive():
+                set_stage(pbar, "worker timeout -> terminate")
                 p.terminate()
                 p.join()
                 q.close(); q.join_thread()
                 continue
             if p.exitcode != 0:
+                set_stage(pbar, f"worker exitcode {p.exitcode}")
                 q.close(); q.join_thread()
                 continue
 
-            geo_data = q.get() if not q.empty() else None
+            # 带超时读取队列，避免 empty()+get() 卡住
+            geo_data = None
+            try:
+                geo_data = q.get(timeout=0.5)
+            except queue.Empty:
+                set_stage(pbar, "queue empty")
+                geo_data = None
+
             q.close(); q.join_thread()
 
             if not geo_data:
                 continue
 
+            set_stage(pbar, "geom ok -> LLM")
             description = generate_text_with_qwen(geo_data['code'])
-            if description:
-                current_id = start_id + success_count
-                dataset_item = {
-                    "id": current_id,
-                    "text": description,
-                    "code": geo_data['code'],
-                    "skeleton": geo_data['skeleton'],
-                    "params": geo_data['params']
-                }
-                f.write(json.dumps(dataset_item, ensure_ascii=False) + "\n")
-                f.flush()
-                success_count += 1
-                pbar.update(1)
+            if not description:
+                set_stage(pbar, "LLM failed/timeout")
+                continue
+
+            current_id = start_id + success_count
+            dataset_item = {
+                "id": current_id,
+                "text": description,
+                "code": geo_data['code'],
+                "skeleton": geo_data['skeleton'],
+                "params": geo_data['params']
+            }
+            f.write(json.dumps(dataset_item, ensure_ascii=False) + "\n")
+            f.flush()
+            success_count += 1
+            set_stage(pbar, f"write id {current_id}")
+            pbar.update(1)
 
             if success_count % 50 == 0:
+                set_stage(pbar, "gc")
                 gc.collect()
         pbar.close()
 
-    print(f"\n✅ 生成完成！已追加到: {OUTPUT_FILE}")
+    set_stage(None, f"✅ 生成完成！已追加到: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
