@@ -1,0 +1,879 @@
+import cadquery as cq
+import random
+import json
+import os
+import gc
+import math
+import multiprocessing as mp
+import queue
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Any, Optional
+
+from openai import OpenAI
+from tqdm import tqdm
+
+# ================= 配置区域 =================
+API_KEY = "sk-bakrzvjqhtfdozmltgmguwkuiyohkxnnmzwkojujtstekprc"  # 替换你的 Key
+API_BASE = "https://api.siliconflow.cn/v1"       # API 地址
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"           # 模型名称
+
+OUTPUT_FILE = "database/complex_cnc_dataset_qwen2-complex-fuzzy.jsonl"
+NUM_SAMPLES = 100
+WORKER_TIMEOUT = 8
+USE_LLM_TEXT = True  # 如需启用 LLM 文本描述，设置为 True 并提供有效 API Key
+INTENT_LANG = "en"   # 新增：intent_text 语言，"en" 生成英文意图（默认），"zh" 可改回中文
+# ===========================================
+
+try:
+    mp.set_start_method("spawn")
+except RuntimeError:
+    pass
+
+client = OpenAI(api_key=API_KEY, base_url=API_BASE) if API_KEY else None
+
+
+@dataclass
+class OpLogEntry:
+    stage: str  # base | feature
+    op: str
+    face: Optional[str]
+    args: Dict[str, float]
+
+
+@dataclass
+class MetricParam:
+    name: str
+    mu: float
+    sigma: float  # Aleatoric uncertainty（公差 / 犹豫程度）
+
+
+@dataclass
+class EnergyCheck:
+    score: float
+    passed: bool
+    reasons: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SampleGeo:
+    code: str
+    skeleton: str
+    params: List[float]
+    dims: Dict[str, Any]
+    op_log: List[OpLogEntry]
+
+
+# ---------- 工具：确保单个实体 ----------
+def ensure_single_solid(local_vars):
+    wp = local_vars["result"]
+    solids = wp.vals()
+    if not solids:
+        raise ValueError("no solids")
+
+    fused = solids[0]
+    for s in solids[1:]:
+        fused = fused.fuse(s)
+
+    wp_single = cq.Workplane(obj=fused)
+    if len(wp_single.vals()) != 1:
+        raise ValueError("multi-body detected")
+
+    return wp_single
+
+
+# ---------- 子进程工作函数：几何生成 ----------
+def worker_generate_sample(out_queue):
+    try:
+        gen = ComplexShapeGenerator()
+        geo = gen.generate_complex_sample()
+        local_vars = {}
+        exec(f"import cadquery as cq\n{geo.code}", {}, local_vars)
+        wp = ensure_single_solid(local_vars)
+        if wp.val().Volume() < 1e-6:
+            out_queue.put(None)
+            return
+        out_queue.put(geo)
+    except Exception:
+        out_queue.put(None)
+
+
+class ComplexShapeGenerator:
+    """
+    复杂几何生成器：支持操作日志 (symbolic trace) 以供上游“意图-结构-参数”解耦。
+    """
+
+    def r_float(self, min_v, max_v):
+        if min_v > max_v:
+            min_v, max_v = max_v, min_v
+        return round(random.uniform(min_v, max_v), 2)
+
+    # ---------- 基体生成 ----------
+    def generate_base(self):
+        base_type = random.choice(
+            [
+                "box",
+                "rounded_box",
+                "cylinder",
+                "chamfered_cyl",
+                "tube",
+                "polygon",
+                "frustum",
+                "ellipse_prism",
+                "ellipse_tube",
+                "lofted_polygon",
+            ]
+        )
+        params = []
+        dims = {"type": base_type}
+        op_log: List[OpLogEntry] = []
+
+        if base_type in ["box", "rounded_box"]:
+            L = self.r_float(30, 130)
+            W = self.r_float(30, 130)
+            H = self.r_float(12, 55)
+            core_expr = f"cq.Workplane('XY').box({L}, {W}, {H})"
+            core_skel = "cq.Workplane('XY').box([ARG], [ARG], [ARG])"
+            params.extend([L, W, H])
+            dims.update({"L": L, "W": W, "H": H, "footprint_L": L, "footprint_W": W})
+            op_log.append(OpLogEntry("base", base_type, None, {"L": L, "W": W, "H": H}))
+            if base_type == "rounded_box":
+                fil_r = min(6.0, min(L, W, H) * 0.12)
+                core_expr += f".edges('|Z').fillet({fil_r})"
+                core_skel += ".edges('|Z').fillet([ARG])"
+                params.append(fil_r)
+                op_log.append(OpLogEntry("base", "fillet_base", None, {"r": fil_r}))
+
+        elif base_type in ["cylinder", "chamfered_cyl"]:
+            R = self.r_float(18, 55)
+            H = self.r_float(16, 70)
+            core_expr = f"cq.Workplane('XY').cylinder({H}, {R})"
+            core_skel = "cq.Workplane('XY').cylinder([ARG], [ARG])"
+            params.extend([H, R])
+            dims.update({"R": R, "H": H, "footprint_L": 2 * R, "footprint_W": 2 * R})
+            op_log.append(OpLogEntry("base", base_type, None, {"H": H, "R": R}))
+            if base_type == "chamfered_cyl":
+                ch = min(4.0, min(R, H) * 0.12)
+                core_expr += f".faces('>Z').edges().chamfer({ch})"
+                core_skel += ".faces('>Z').edges().chamfer([ARG])"
+                params.append(ch)
+                op_log.append(OpLogEntry("base", "chamfer_base", ">Z", {"d": ch}))
+
+        elif base_type == "tube":
+            R_outer = self.r_float(26, 65)
+            thickness = self.r_float(5, 14)
+            R_inner = round(R_outer - thickness, 2)
+            H = self.r_float(24, 80)
+            core_expr = f"cq.Workplane('XY').tube({H}, {R_outer}, {R_inner})"
+            core_skel = "cq.Workplane('XY').tube([ARG], [ARG], [ARG])"
+            params.extend([H, R_outer, R_inner])
+            dims.update(
+                {
+                    "R": R_outer,
+                    "H": H,
+                    "thickness": thickness,
+                    "footprint_L": 2 * R_outer,
+                    "footprint_W": 2 * R_outer,
+                }
+            )
+            op_log.append(OpLogEntry("base", base_type, None, {"H": H, "R_outer": R_outer, "R_inner": R_inner}))
+
+        elif base_type == "polygon":
+            n_sides = random.choice([6, 8])
+            diameter = self.r_float(28, 80)
+            H = self.r_float(16, 55)
+            side_len = diameter * math.sin(math.pi / n_sides)
+            core_expr = f"cq.Workplane('XY').polygon({n_sides}, {diameter}).extrude({H})"
+            core_skel = "cq.Workplane('XY').polygon([ARG], [ARG]).extrude([ARG])"
+            params.extend([float(n_sides), diameter, H])
+            dims.update(
+                {"R": diameter / 2, "H": H, "side_len": side_len, "footprint_L": diameter, "footprint_W": diameter}
+            )
+            op_log.append(OpLogEntry("base", base_type, None, {"n": n_sides, "D": diameter, "H": H}))
+
+        elif base_type == "frustum":
+            R1 = self.r_float(18, 50)
+            R2 = self.r_float(10, R1)
+            H = self.r_float(20, 60)
+            core_expr = (
+                f"cq.Workplane('XY').circle({R1}).workplane(offset={H}).circle({R2}).loft(combine=True)"
+            )
+            core_skel = "cq.Workplane('XY').circle([ARG]).workplane(offset=[ARG]).circle([ARG]).loft(combine=True)"
+            params.extend([R1, H, R2])
+            footprint = 2 * max(R1, R2)
+            dims.update({"R1": R1, "R2": R2, "H": H, "footprint_L": footprint, "footprint_W": footprint})
+            op_log.append(OpLogEntry("base", base_type, None, {"R1": R1, "R2": R2, "H": H}))
+
+        elif base_type == "ellipse_prism":
+            a = self.r_float(22, 60)
+            b = self.r_float(16, a)
+            H = self.r_float(16, 55)
+            core_expr = f"cq.Workplane('XY').ellipse({a}, {b}).extrude({H})"
+            core_skel = "cq.Workplane('XY').ellipse([ARG], [ARG]).extrude([ARG])"
+            params.extend([a, b, H])
+            dims.update({"a": a, "b": b, "H": H, "footprint_L": 2 * a, "footprint_W": 2 * b})
+            op_log.append(OpLogEntry("base", base_type, None, {"a": a, "b": b, "H": H}))
+
+        elif base_type == "ellipse_tube":
+            a = self.r_float(22, 60)
+            b = self.r_float(16, a)
+            thickness = self.r_float(4.5, 12)
+            a_in = max(6.0, a - thickness)
+            b_in = max(6.0, b - thickness)
+            H = self.r_float(20, 60)
+            core_expr = (
+                f"cq.Workplane('XY').ellipse({a}, {b}).extrude({H})"
+                f".faces('>Z').workplane().ellipse({a_in}, {b_in}).cutThruAll()"
+                f".faces('<Z').workplane().ellipse({a_in}, {b_in}).cutThruAll()"
+            )
+            core_skel = (
+                "cq.Workplane('XY').ellipse([ARG], [ARG]).extrude([ARG])"
+                ".faces('>Z').workplane().ellipse([ARG], [ARG]).cutThruAll()"
+                ".faces('<Z').workplane().ellipse([ARG], [ARG]).cutThruAll()"
+            )
+            params.extend([a, b, H, a_in, b_in])
+            dims.update(
+                {
+                    "a": a,
+                    "b": b,
+                    "H": H,
+                    "thickness": thickness,
+                    "footprint_L": 2 * a,
+                    "footprint_W": 2 * b,
+                }
+            )
+            op_log.append(OpLogEntry("base", base_type, None, {"a": a, "b": b, "H": H, "a_in": a_in, "b_in": b_in}))
+
+        elif base_type == "lofted_polygon":
+            n_sides = random.choice([5, 6, 8])
+            d1 = self.r_float(28, 80)
+            shrink = self.r_float(0.5, 0.9)
+            d2 = max(12, round(d1 * shrink, 2))
+            H = self.r_float(20, 60)
+            core_expr = (
+                f"cq.Workplane('XY').polygon({n_sides}, {d1})"
+                f".workplane(offset={H}).polygon({n_sides}, {d2}).loft(combine=True)"
+            )
+            core_skel = (
+                "cq.Workplane('XY').polygon([ARG], [ARG]).workplane(offset=[ARG]).polygon([ARG], [ARG]).loft(combine=True)"
+            )
+            params.extend([float(n_sides), d1, H, d2])
+            footprint = max(d1, d2)
+            side_len = d1 * math.sin(math.pi / n_sides)
+            dims.update({"R": footprint / 2, "H": H, "side_len": side_len, "footprint_L": footprint, "footprint_W": footprint})
+            op_log.append(OpLogEntry("base", base_type, None, {"n": n_sides, "D1": d1, "D2": d2, "H": H}))
+
+        # 可选台座
+        add_pad = random.random() < 0.35
+        if add_pad:
+            pad_margin = self.r_float(4, 16)
+            pad_t = self.r_float(3, 12)
+            base_L = dims.get("footprint_L", 60)
+            base_W = dims.get("footprint_W", base_L)
+            pad_expr = (
+                f"cq.Workplane('XY').rect({base_L + 2 * pad_margin}, {base_W + 2 * pad_margin})"
+                f".extrude({pad_t}).translate((0, 0, -{pad_t / 2}))"
+            )
+            pad_skel = "cq.Workplane('XY').rect([ARG], [ARG]).extrude([ARG]).translate((0, 0, -[ARG]/2))"
+            params.extend([base_L + 2 * pad_margin, base_W + 2 * pad_margin, pad_t])
+            code = f"result = ({core_expr}.union({pad_expr}))"
+            skeleton = f"result = ({core_skel}.union({pad_skel}))"
+            dims.update({"pad_t": pad_t})
+            op_log.append(
+                OpLogEntry(
+                    "base",
+                    "pad",
+                    None,
+                    {"L": base_L + 2 * pad_margin, "W": base_W + 2 * pad_margin, "t": pad_t},
+                )
+            )
+        else:
+            code = f"result = {core_expr}"
+            skeleton = f"result = {core_skel}"
+
+        return code, skeleton, params, dims, op_log
+
+    # ---------- 面选择 ----------
+    def pick_face(self, dims, op):
+        base = dims["type"]
+        if op == "ring_groove":
+            return random.choice([">Z", "<Z"])
+        if base in ["box", "rounded_box"]:
+            return random.choice([">Z", "<Z", ">X", "<X", ">Y", "<Y"])
+        if base in ["polygon", "frustum", "ellipse_prism", "ellipse_tube", "lofted_polygon"]:
+            return random.choice([">Z", "<Z"])
+        if base in ["cylinder", "chamfered_cyl", "tube"]:
+            if op in ["top_hole", "counterbore", "circular_array_holes", "grid_array_holes"]:
+                return random.choice([">Z", "<Z", ">X", "<X", ">Y", "<Y"])
+            else:
+                return random.choice([">Z", "<Z"])
+        return ">Z"
+
+    def face_plane_limit(self, dims, face, default_plane_limit):
+        if dims["type"] not in ["box", "rounded_box"]:
+            return default_plane_limit
+        if face in [">Z", "<Z"]:
+            return min(dims["L"], dims["W"])
+        if face in [">X", "<X"]:
+            return min(dims["W"], dims["H"])
+        if face in [">Y", "<Y"]:
+            return min(dims["L"], dims["H"])
+        return default_plane_limit
+
+    def signed_depth(self, face, depth):
+        return -depth if face in [">Z", ">X", ">Y"] else depth
+
+    # ---------- 特征生成 ----------
+    def add_feature(self, code, skel, params, dims, op_log):
+        base_type = dims["type"]
+        features = [
+            "top_hole",
+            "counterbore",
+            "circular_array_holes",
+            "grid_array_holes",
+            "slot",
+            "radial_slot",
+            "top_pocket",
+            "pocket_circle",
+            "ring_groove",
+            "top_boss",
+            "side_boss",
+            "side_hole",
+            "side_slot",
+            "keyway_slot",
+            "fillet",
+            "chamfer",
+        ]
+        if base_type in ["tube", "ellipse_tube"]:
+            forbid = {
+                "top_pocket",
+                "slot",
+                "radial_slot",
+                "circular_array_holes",
+                "grid_array_holes",
+                "ring_groove",
+                "top_boss",
+                "side_boss",
+                "side_slot",
+                "side_hole",
+                "keyway_slot",
+            }
+            features = [f for f in features if f not in forbid]
+        if base_type not in ["box", "rounded_box"]:
+            features = [f for f in features if f not in ["side_slot", "side_hole", "side_boss", "keyway_slot"]]
+
+        choice = random.choice(features)
+
+        if base_type in ["box", "rounded_box"]:
+            min_dim = min(dims["L"], dims["W"], dims["H"])
+            plane_limit = min(dims["L"], dims["W"])
+        elif base_type in ["cylinder", "chamfered_cyl"]:
+            min_dim = min(dims["R"], dims["H"])
+            plane_limit = dims["R"] * 2
+        elif base_type == "tube":
+            min_dim = min(dims["thickness"], dims["H"])
+            plane_limit = dims["thickness"] * 2
+        elif base_type in ["polygon", "lofted_polygon"]:
+            min_dim = min(dims.get("side_len", 10), dims["H"])
+            plane_limit = dims["R"] * 1.6
+        elif base_type == "frustum":
+            min_dim = min(dims["R2"], dims["H"])
+            plane_limit = max(dims["R1"], dims["R2"]) * 2
+        elif base_type == "ellipse_prism":
+            min_dim = min(dims["b"], dims["H"])
+            plane_limit = min(dims["a"], dims["b"]) * 2
+        elif base_type == "ellipse_tube":
+            min_dim = min(dims["thickness"], dims["H"])
+            plane_limit = dims["thickness"] * 2
+        else:
+            min_dim = plane_limit = 20
+
+        face = self.pick_face(dims, choice)
+        plane_limit = self.face_plane_limit(dims, face, plane_limit)
+
+        def log(op_name, args):
+            op_log.append(OpLogEntry("feature", op_name, face, args))
+
+        if choice == "top_hole":
+            max_r = plane_limit * 0.28
+            if base_type in ["tube", "ellipse_tube"]:
+                max_r = dims["thickness"] * 0.45
+            r = self.r_float(1.5, max(2.0, max_r))
+            code += f".faces('{face}').workplane().hole({r * 2})"
+            skel += ".faces('[FACE]').workplane().hole([ARG])"
+            params.extend([face, r * 2])
+            log("hole", {"d": r * 2})
+
+        elif choice == "counterbore":
+            pilot = self.r_float(2, plane_limit * 0.2)
+            cbore_d = pilot + self.r_float(2, plane_limit * 0.2)
+            cbore_depth = self.r_float(1, max(1.2, min_dim * 0.35))
+            code += f".faces('{face}').workplane().cboreHole({pilot}, {cbore_d}, {cbore_depth})"
+            skel += ".faces('[FACE]').workplane().cboreHole([ARG], [ARG], [ARG])"
+            params.extend([face, pilot, cbore_d, cbore_depth])
+            log("counterbore", {"pilot": pilot, "cbore_d": cbore_d, "depth": cbore_depth})
+
+        elif choice == "circular_array_holes":
+            arr_r = plane_limit * 0.32
+            hole_d = self.r_float(2, max(2.2, plane_limit * 0.18))
+            count = random.randint(4, 8)
+            code += f".faces('{face}').workplane().polarArray({arr_r}, 0, 360, {count}).hole({hole_d})"
+            skel += ".faces('[FACE]').workplane().polarArray([ARG], 0, 360, [ARG]).hole([ARG])"
+            params.extend([face, arr_r, count, hole_d])
+            log("circular_array_holes", {"r": arr_r, "count": count, "d": hole_d})
+
+        elif choice == "grid_array_holes":
+            step_x = plane_limit * 0.35
+            step_y = plane_limit * 0.35
+            nx = random.randint(2, 3)
+            ny = random.randint(2, 3)
+            hole_d = self.r_float(2, max(2.2, plane_limit * 0.15))
+            code += f".faces('{face}').workplane().rarray({step_x}, {step_y}, {nx}, {ny}).hole({hole_d})"
+            skel += ".faces('[FACE]').workplane().rarray([ARG], [ARG], [ARG], [ARG]).hole([ARG])"
+            params.extend([face, step_x, step_y, nx, ny, hole_d])
+            log("grid_array_holes", {"step_x": step_x, "step_y": step_y, "nx": nx, "ny": ny, "d": hole_d})
+
+        elif choice == "slot":
+            limit_w = plane_limit * 0.65
+            length = self.r_float(10, max(12, limit_w))
+            width = self.r_float(3, max(4, plane_limit * 0.25))
+            depth = self.r_float(2, max(2.5, min_dim * 0.5))
+            signed_d = self.signed_depth(face, depth)
+            code += f".faces('{face}').workplane().slot({length}, {width}).cutBlind({signed_d})"
+            skel += ".faces('[FACE]').workplane().slot([ARG], [ARG]).cutBlind([ARG])"
+            params.extend([face, length, width, signed_d])
+            log("slot", {"L": length, "W": width, "depth": signed_d})
+
+        elif choice == "radial_slot":
+            arr_r = plane_limit * 0.35
+            length = self.r_float(8, max(10, plane_limit * 0.45))
+            width = self.r_float(3, max(3.5, plane_limit * 0.2))
+            depth = self.r_float(2, max(2.5, min_dim * 0.45))
+            count = random.randint(3, 6)
+            signed_d = self.signed_depth(face, depth)
+            code += f".faces('{face}').workplane().polarArray({arr_r}, 0, 360, {count}).slot({length}, {width}).cutBlind({signed_d})"
+            skel += ".faces('[FACE]').workplane().polarArray([ARG], 0, 360, [ARG]).slot([ARG], [ARG]).cutBlind([ARG])"
+            params.extend([face, arr_r, count, length, width, signed_d])
+            log("radial_slot", {"r": arr_r, "count": count, "L": length, "W": width, "depth": signed_d})
+
+        elif choice == "top_pocket":
+            limit_w = plane_limit * 0.75
+            w = self.r_float(6, max(7, limit_w))
+            h = self.r_float(6, max(7, limit_w))
+            max_d = min_dim * 0.9
+            d = self.r_float(2.5, max(3.0, max_d))
+            signed_d = self.signed_depth(face, d)
+            code += f".faces('{face}').workplane().rect({w}, {h}).cutBlind({signed_d})"
+            skel += ".faces('[FACE]').workplane().rect([ARG], [ARG]).cutBlind([ARG])"
+            params.extend([face, w, h, signed_d])
+            log("top_pocket", {"W": w, "H": h, "depth": signed_d})
+
+        elif choice == "pocket_circle":
+            r = self.r_float(3, max(4, plane_limit * 0.25))
+            d = self.r_float(2.5, max(3.0, min_dim * 0.85))
+            signed_d = self.signed_depth(face, d)
+            code += f".faces('{face}').workplane().circle({r}).cutBlind({signed_d})"
+            skel += ".faces('[FACE]').workplane().circle([ARG]).cutBlind([ARG])"
+            params.extend([face, r, signed_d])
+            log("pocket_circle", {"r": r, "depth": signed_d})
+
+        elif choice == "ring_groove":
+            outer = plane_limit * 0.45
+            inner = max(outer * 0.55, outer - self.r_float(3, 8))
+            depth = self.r_float(1.5, max(2.0, min_dim * 0.25))
+            signed_d = self.signed_depth(face, depth)
+            code += f".faces('{face}').workplane().circle({outer}).circle({inner}).cutBlind({signed_d})"
+            skel += ".faces('[FACE]').workplane().circle([ARG]).circle([ARG]).cutBlind([ARG])"
+            params.extend([face, outer, inner, signed_d])
+            log("ring_groove", {"outer": outer, "inner": inner, "depth": signed_d})
+
+        elif choice == "top_boss":
+            limit_r = plane_limit * 0.32
+            r = self.r_float(2.5, max(3.0, limit_r))
+            h = self.r_float(3, 14)
+            code += f".faces('{face}').workplane().circle({r}).extrude({h})"
+            skel += ".faces('[FACE]').workplane().circle([ARG]).extrude([ARG])"
+            params.extend([face, r, h])
+            log("top_boss", {"r": r, "h": h})
+
+        elif choice == "side_boss" and base_type in ["box", "rounded_box"]:
+            face = random.choice([">X", "<X", ">Y", "<Y"])
+            limit_side = min(dims["W"], dims["H"]) if face in [">X", "<X"] else min(dims["L"], dims["H"])
+            r = self.r_float(2.5, max(3.0, limit_side * 0.35))
+            h = self.r_float(3, max(4, limit_side * 0.6))
+            code += f".faces('{face}').workplane().circle({r}).extrude({h})"
+            skel += ".faces('[FACE]').workplane().circle([ARG]).extrude([ARG])"
+            params.extend([face, r, h])
+            log("side_boss", {"r": r, "h": h})
+
+        elif choice == "side_hole" and base_type in ["box", "rounded_box"]:
+            face = random.choice([">X", "<X", ">Y", "<Y"])
+            limit_side = min(dims["W"], dims["H"]) if face in [">X", "<X"] else min(dims["L"], dims["H"])
+            r = self.r_float(2, max(2.2, limit_side * 0.32))
+            code += f".faces('{face}').workplane().hole({r * 2})"
+            skel += ".faces('[FACE]').workplane().hole([ARG])"
+            params.extend([face, r * 2])
+            log("side_hole", {"d": r * 2})
+
+        elif choice == "side_slot" and base_type in ["box", "rounded_box"]:
+            face = random.choice([">X", "<X", ">Y", "<Y"])
+            limit_side = min(dims["W"], dims["H"]) if face in [">X", "<X"] else min(dims["L"], dims["H"])
+            length = self.r_float(12, max(14, limit_side * 0.85))
+            width = self.r_float(3, max(3.5, limit_side * 0.35))
+            depth = self.r_float(2, max(2.5, limit_side * 0.6))
+            signed_d = self.signed_depth(face, depth)
+            code += f".faces('{face}').workplane().slot({length}, {width}).cutBlind({signed_d})"
+            skel += ".faces('[FACE]').workplane().slot([ARG], [ARG]).cutBlind([ARG])"
+            params.extend([face, length, width, signed_d])
+            log("side_slot", {"L": length, "W": width, "depth": signed_d})
+
+        elif choice == "keyway_slot" and base_type in ["box", "rounded_box"]:
+            face = random.choice([">X", "<X", ">Y", "<Y"])
+            limit_side = min(dims["W"], dims["H"]) if face in [">X", "<X"] else min(dims["L"], dims["H"])
+            w = self.r_float(3, max(3.5, limit_side * 0.28))
+            h = self.r_float(3, max(3.5, limit_side * 0.3))
+            depth = self.r_float(2, max(2.5, limit_side * 0.6))
+            signed_d = self.signed_depth(face, depth)
+            code += f".faces('{face}').workplane().rect({w}, {h}).cutBlind({signed_d})"
+            skel += ".faces('[FACE]').workplane().rect([ARG], [ARG]).cutBlind([ARG])"
+            params.extend([face, w, h, signed_d])
+            log("keyway_slot", {"W": w, "H": h, "depth": signed_d})
+
+        elif choice == "fillet":
+            max_f = min(5.0, min_dim * 0.12)
+            r = self.r_float(0.6, max(0.8, max_f))
+            code += f".edges('|Z').fillet({r})"
+            skel += ".edges('|Z').fillet([ARG])"
+            params.append(r)
+            log("fillet", {"r": r})
+
+        elif choice == "chamfer":
+            max_c = min(3.5, min_dim * 0.12)
+            d = self.r_float(0.6, max(0.8, max_c))
+            code += f".faces('>Z').edges().chamfer({d})"
+            skel += ".faces('>Z').edges().chamfer([ARG])"
+            params.append(d)
+            log("chamfer", {"d": d})
+
+        return code, skel, params, op_log
+
+    # ---------- 样本生成 ----------
+    def generate_complex_sample(self) -> SampleGeo:
+        code, skel, params, dims, op_log = self.generate_base()
+        num_features = random.randint(6, 8)
+        for _ in range(num_features):
+            tmp_code, tmp_skel, tmp_params, tmp_log = self.add_feature(code, skel, list(params), dims, list(op_log))
+            try:
+                local_vars = {}
+                exec(f"import cadquery as cq\n{tmp_code}", {}, local_vars)
+                local_vars["result"] = ensure_single_solid(local_vars)
+                code, skel, params, op_log = tmp_code, tmp_skel, tmp_params, tmp_log
+            except Exception:
+                pass
+        extra_features = random.randint(2, 3)
+        for _ in range(extra_features):
+            tmp_code, tmp_skel, tmp_params, tmp_log = self.add_feature(code, skel, list(params), dims, list(op_log))
+            try:
+                local_vars = {}
+                exec(f"import cadquery as cq\n{tmp_code}", {}, local_vars)
+                local_vars["result"] = ensure_single_solid(local_vars)
+                code, skel, params, op_log = tmp_code, tmp_skel, tmp_params, tmp_log
+            except Exception:
+                pass
+        return SampleGeo(code=code, skeleton=skel, params=params, dims=dims, op_log=op_log)
+
+
+# ---------- 文本 / 意图生成 ----------
+def generate_text_with_qwen(code_str):
+    if not client or not API_KEY:
+        return None
+    prompt = (
+        "You are a mechanical engineer. "
+        "Describe the geometry created by this Python CadQuery code in one sentence. "
+        "Requirements:\n"
+        "1. Start with the base shape.\n"
+        "2. Mention every modification (hole, pocket, boss, slot, groove, fillet, chamfer, arrays).\n"
+        "3. Include ALL numbers found in the code (dimensions, radius, depth).\n"
+        "4. No code explanations, just the physical description.\n\n"
+        f"Code:\n{code_str}"
+    )
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=180,
+            timeout=15,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+
+def build_metric_params(op_log: List[OpLogEntry]) -> List[MetricParam]:
+    params = []
+    for entry in op_log:
+        for k, v in entry.args.items():
+            sigma = round(max(0.2, abs(v) * 0.05), 3)  # 5% 宽度作为 Aleatoric σ
+            params.append(MetricParam(name=f"{entry.op}.{k}", mu=v, sigma=sigma))
+    return params
+
+
+def choose_explicit_params(metric_params: List[MetricParam], ratio: float = 0.35):
+    count = max(1, int(len(metric_params) * ratio))
+    chosen = random.sample(metric_params, count)
+    explicit_names = {p.name for p in chosen}
+    for p in metric_params:
+        if p.name in explicit_names:
+            p.sigma = 0.0  # Pointer Mechanism: 显式锁死
+    return explicit_names, metric_params
+
+
+def machinability_energy(dims: Dict[str, Any], op_log: List[OpLogEntry]) -> EnergyCheck:
+    reasons = []
+    score = 0.0
+
+    # 1) 长细比
+    if dims.get("H") and dims.get("footprint_L"):
+        aspect = dims["H"] / max(1e-3, dims["footprint_L"])
+        if aspect > 1.2:
+            score += (aspect - 1.2) * 5
+            reasons.append(f"High aspect ratio {aspect:.2f}")
+
+    # 2) 管/薄壁
+    if dims["type"] in ["tube", "ellipse_tube"]:
+        t = dims.get("thickness", 0)
+        if t < 4.0:
+            score += (4.0 - t) * 3
+            reasons.append(f"Thin wall {t:.2f}")
+
+    # 3) 小孔过深
+    for op in op_log:
+        if op.op in ["hole", "counterbore", "side_hole"] and "d" in op.args:
+            d = op.args.get("d") or op.args.get("cbore_d") or op.args.get("pilot")
+            depth = abs(op.args.get("depth", 0))
+            if d and depth and depth > 6 * d:
+                score += (depth / d - 6) * 2
+                reasons.append(f"Deep hole depth/d={depth/d:.1f}")
+
+    passed = score < 8.0
+    return EnergyCheck(score=round(score, 3), passed=passed, reasons=reasons)
+
+
+# ---------- 英文 intent 构造 ----------
+FACE_EN = {
+    ">Z": "top",
+    "<Z": "bottom",
+    ">X": "right",
+    "<X": "left",
+    ">Y": "front",
+    "<Y": "back",
+    None: "",
+}
+
+OP_EN = {
+    "box": "a box",
+    "rounded_box": "a filleted box",
+    "cylinder": "a cylinder",
+    "chamfered_cyl": "a chamfered cylinder",
+    "tube": "a tube",
+    "polygon": "a prismatic polygon",
+    "frustum": "a frustum",
+    "ellipse_prism": "an elliptical prism",
+    "ellipse_tube": "an elliptical tube",
+    "lofted_polygon": "a lofted polygon",
+    "pad": "a base pad",
+    "fillet_base": "edge fillets",
+    "chamfer_base": "top chamfers",
+    "hole": "through holes",
+    "counterbore": "counterbore holes",
+    "circular_array_holes": "circular array holes",
+    "grid_array_holes": "grid array holes",
+    "slot": "slots",
+    "radial_slot": "radial slots",
+    "top_pocket": "rectangular pockets",
+    "pocket_circle": "circular pockets",
+    "ring_groove": "ring grooves",
+    "top_boss": "bosses",
+    "side_boss": "side bosses",
+    "side_hole": "side holes",
+    "side_slot": "side slots",
+    "keyway_slot": "keyway slots",
+    "fillet": "fillets",
+    "chamfer": "chamfers",
+}
+
+def face_to_en(face: Optional[str]) -> str:
+    return FACE_EN.get(face, f"face {face}")
+
+
+def build_intent_text_en(op_log: List[OpLogEntry], explicit_names: set):
+    phrases = []
+    base = next((op for op in op_log if op.stage == "base"), None)
+    if base:
+        base_name = OP_EN.get(base.op, base.op)
+        phrases.append(f"Start with {base_name}.")
+    for op in op_log:
+        if op.stage != "feature":
+            continue
+        face_str = face_to_en(op.face)
+        nums = []
+        for k, v in op.args.items():
+            name = f"{op.op}.{k}"
+            if name in explicit_names:
+                nums.append(f"{k}={v} mm")
+        nums_str = (" with " + ", ".join(nums)) if nums else ""
+        where = f" on the {face_str}" if face_str else ""
+        op_name = OP_EN.get(op.op, op.op.replace("_", " "))
+        phrases.append(f"Add {op_name}{where}{nums_str}.")
+    if not phrases:
+        return "Create a complex part with multiple holes, slots, bosses, grooves, fillets, and chamfers."
+    return " ".join(phrases)
+
+
+def build_intent_text(op_log: List[OpLogEntry], explicit_names: set):
+    if INTENT_LANG.lower() == "en":
+        return build_intent_text_en(op_log, explicit_names)
+    # fallback: original中文版本
+    phrases = []
+    base = next((op for op in op_log if op.stage == "base"), None)
+    if base:
+        phrases.append(f"做一个{base.op}作为基体")
+    for op in op_log:
+        if op.stage == "feature":
+            nums = []
+            for k, v in op.args.items():
+                name = f"{op.op}.{k}"
+                if name in explicit_names:
+                    nums.append(f"{v}mm")
+            nums_str = ("，尺寸 " + ", ".join(nums)) if nums else ""
+            face = f"在{op.face}" if op.face else ""
+            phrases.append(f"{face}加 {op.op}{nums_str}")
+    return "，".join(phrases) or "生成一个复杂零件，包含多种孔、槽、凸台和倒角"
+
+
+# ---------- ID 续写 ----------
+def get_start_id(filename):
+    start_id = 0
+    if os.path.exists(filename):
+        try:
+            with open(filename, "rb") as f:
+                try:
+                    f.seek(-2, os.SEEK_END)
+                    while f.read(1) != b"\n":
+                        f.seek(-2, os.SEEK_CUR)
+                except OSError:
+                    f.seek(0)
+                last_line = f.readline().decode().strip()
+                if last_line:
+                    try:
+                        data = json.loads(last_line)
+                        start_id = data.get("id", -1) + 1
+                        print(f"📂 发现已有数据，将从 ID {start_id} 继续追加...")
+                    except json.JSONDecodeError:
+                        print("⚠️ 最后一行 JSON 解析失败，将从 ID 0 开始")
+        except Exception as e:
+            print(f"⚠️ 读取文件出错: {e}，将从 ID 0 开始")
+    else:
+        print("📂 文件不存在，将创建新文件并从 ID 0 开始...")
+    return start_id
+
+
+# ---------- 阶段显示辅助 ----------
+def set_stage(pbar, stage):
+    if pbar:
+        pbar.set_postfix_str(stage)
+    print(f"[stage] {stage}")
+
+
+# ---------- 主流程 ----------
+def main():
+    start_id = get_start_id(OUTPUT_FILE)
+
+    print("🚀 生成 CNC 数据集 (意图-符号-度量 解耦 & 物理安检版)")
+    print(f"📡 模型: {MODEL_NAME} (LLM文本描述 {'ON' if USE_LLM_TEXT else 'OFF'})")
+    print(f"➕ 本次计划新增: {NUM_SAMPLES} 条")
+    print(f"🔢 ID 范围: {start_id} -> {start_id + NUM_SAMPLES - 1}")
+    print(f"🌐 intent_text language: {INTENT_LANG}")
+
+    success_count = 0
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+        pbar = tqdm(total=NUM_SAMPLES)
+        while success_count < NUM_SAMPLES:
+            set_stage(pbar, "spawn worker")
+            q = mp.Queue()
+            p = mp.Process(target=worker_generate_sample, args=(q,))
+            p.start()
+
+            set_stage(pbar, "wait worker")
+            p.join(WORKER_TIMEOUT)
+
+            if p.is_alive():
+                set_stage(pbar, "worker timeout -> terminate")
+                p.terminate()
+                p.join()
+                q.close()
+                q.join_thread()
+                continue
+            if p.exitcode != 0:
+                set_stage(pbar, f"worker exitcode {p.exitcode}")
+                q.close()
+                q.join_thread()
+                continue
+
+            geo: Optional[SampleGeo] = None
+            try:
+                geo = q.get(timeout=0.5)
+            except queue.Empty:
+                set_stage(pbar, "queue empty")
+
+            q.close()
+            q.join_thread()
+
+            if not geo:
+                continue
+
+            # 物理安检
+            energy = machinability_energy(geo.dims, geo.op_log)
+            if not energy.passed:
+                set_stage(pbar, f"energy reject {energy.score}")
+                continue
+
+            # 符号/度量解耦
+            metric_params = build_metric_params(geo.op_log)
+            explicit_names, metric_params = choose_explicit_params(metric_params, ratio=0.35)
+            intent_text = build_intent_text(geo.op_log, explicit_names)
+
+            # 文本描述（可选 LLM）
+            description = generate_text_with_qwen(geo.code) if USE_LLM_TEXT else None
+
+            current_id = start_id + success_count
+            dataset_item = {
+                "id": current_id,
+                "intent_text": intent_text,
+                "symbolic_trace": [asdict(op) for op in geo.op_log],
+                "metric_params": [asdict(p) for p in metric_params],
+                "explicit_constraints": list(explicit_names),
+                "implicit_params": [p.name for p in metric_params if p.name not in explicit_names],
+                "energy_check": asdict(energy),
+                "code": geo.code,
+                "skeleton": geo.skeleton,
+                "params": geo.params,
+                "llm_description": description,
+            }
+
+            f.write(json.dumps(dataset_item, ensure_ascii=False) + "\n")
+            f.flush()
+            success_count += 1
+            set_stage(pbar, f"write id {current_id}")
+            pbar.update(1)
+
+            if success_count % 50 == 0:
+                set_stage(pbar, "gc")
+                gc.collect()
+        pbar.close()
+
+    set_stage(None, f"✅ 生成完成！已追加到: {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
