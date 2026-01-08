@@ -17,9 +17,9 @@ API_KEY = "sk-bakrzvjqhtfdozmltgmguwkuiyohkxnnmzwkojujtstekprc"  # 替换你的 
 API_BASE = "https://api.siliconflow.cn/v1"       # API 地址
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"           # 模型名称
 
-OUTPUT_FILE = "database/complex_cnc_dataset_qwen2-complex-fuzzy.jsonl"
-NUM_SAMPLES = 100
-WORKER_TIMEOUT = 8
+OUTPUT_FILE = "database/complex_cnc_dataset_qwen2-complex-fuzzy2.jsonl"
+NUM_SAMPLES = 1000
+WORKER_TIMEOUT = 30
 USE_LLM_TEXT = True  # 如需启用 LLM 文本描述，设置为 True 并提供有效 API Key
 INTENT_LANG = "en"   # 新增：intent_text 语言，"en" 生成英文意图（默认），"zh" 可改回中文
 # ===========================================
@@ -809,25 +809,36 @@ def main():
 
             if p.is_alive():
                 set_stage(pbar, "worker timeout -> terminate")
+                
+                # 1. 先杀死进程
                 p.terminate()
-                p.join()
+                p.join()  # 等待进程彻底销毁
+                
+                # 2. 【关键】告诉 Queue 不要等待后台线程了
+                # 因为进程是被杀死的，队列里的数据可能不完整，必须放弃
+                q.cancel_join_thread() 
                 q.close()
-                q.join_thread()
+                
+                # 3. 继续下一个循环，不要执行后面的逻辑
                 continue
+            # === 修改结束 ===
+
             if p.exitcode != 0:
                 set_stage(pbar, f"worker exitcode {p.exitcode}")
+                q.cancel_join_thread() # 安全起见加上
                 q.close()
-                q.join_thread()
                 continue
 
             geo: Optional[SampleGeo] = None
             try:
+                # 尝试获取数据
                 geo = q.get(timeout=0.5)
             except queue.Empty:
                 set_stage(pbar, "queue empty")
-
+            
+            # 正常结束也要清理
             q.close()
-            q.join_thread()
+            q.join_thread() # 正常退出时可以等待
 
             if not geo:
                 continue
